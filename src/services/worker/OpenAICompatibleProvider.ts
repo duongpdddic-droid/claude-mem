@@ -15,6 +15,7 @@ import {
   isAbortError,
   type WorkerRef
 } from './agents/index.js';
+import { REASK_PURE_XML_PROMPT } from './agents/generate-retry.js';
 
 /**
  * Normalized result returned by a concrete provider's `query()`.
@@ -193,6 +194,41 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     }
   }
 
+  /**
+   * Build the reask closure for the durable-observation-loss recovery path
+   * (Issue #2). On an invalid generation turn, ResponseProcessor re-invokes
+   * this to force a strict pure-XML re-generation. History stays coherent —
+   * the reask is appended as a user turn and the retried assistant reply is
+   * stored back, so the next message-loop iteration reads a healthy history.
+   * A query failure returns null so the recovery loop dead-letters instead of
+   * throwing out of the provider's message loop.
+   */
+  protected buildRecoveryReask(
+    history: ConversationMessage[],
+    config: TConfig
+  ): () => Promise<string | null> {
+    return async () => {
+      history.push({ role: 'user', content: REASK_PURE_XML_PROMPT });
+      try {
+        const resp = await this.query(history, config);
+        if (resp.content) {
+          history.push({ role: 'assistant', content: resp.content });
+          return resp.content;
+        }
+        return null;
+      } catch (error) {
+        if (isClassified(error)) {
+          logger.debug('SDK', `${this.providerName} recovery reask query failed`, { kind: error.kind }, error);
+        } else if (error instanceof Error) {
+          logger.error('SDK', `${this.providerName} recovery reask query failed`, new Error(error.message));
+        } else {
+          logger.error('SDK', `${this.providerName} recovery reask query failed with non-Error`, new Error(String(error)));
+        }
+        return null;
+      }
+    };
+  }
+
   private async processObservationMessage(
     session: ActiveSession,
     message: { prompt_number?: number; tool_name?: string; tool_input?: unknown; tool_response?: unknown; cwd?: string },
@@ -238,7 +274,8 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     if (obsResponse.content || this.forwardEmptyMessageResponse) {
       await processAgentResponse(
         obsResponse.content || '', session, this.dbManager, this.sessionManager,
-        worker, tokensUsed, originalTimestamp, this.providerName, lastCwd, obsResponse.servedModel ?? config.model, responseContext
+        worker, tokensUsed, originalTimestamp, this.providerName, lastCwd, obsResponse.servedModel ?? config.model, responseContext,
+        this.buildRecoveryReask(session.conversationHistory, config)
       );
     } else {
       logger.warn('SDK', `Empty ${this.providerName} observation response, leaving queue intact`, {
@@ -294,7 +331,8 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     if (summaryResponse.content || this.forwardEmptyMessageResponse) {
       await processAgentResponse(
         summaryResponse.content || '', session, this.dbManager, this.sessionManager,
-        worker, tokensUsed, originalTimestamp, this.providerName, lastCwd, summaryResponse.servedModel ?? summaryConfig.model, responseContext
+        worker, tokensUsed, originalTimestamp, this.providerName, lastCwd, summaryResponse.servedModel ?? summaryConfig.model, responseContext,
+        this.buildRecoveryReask(session.conversationHistory, summaryConfig)
       );
     } else {
       logger.warn('SDK', `Empty ${this.providerName} summary response, leaving queue intact`, {

@@ -1,5 +1,7 @@
 import { describe, it, expect, mock, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, readFileSync, mkdtempSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { logger } from '../../../src/utils/logger.js';
 
 // Capture real exports before mock.module mutates the live namespace, then
@@ -532,8 +534,10 @@ describe('ResponseProcessor', () => {
   });
 
   describe('non-XML observer responses', () => {
-    it('warns and clears pending work when the observer returns non-XML prose', async () => {
+    it('dead-letters prose (never silently drops) and clears pending work when no recovery reask is available', async () => {
       const confirmClaimedMessages = mock(() => Promise.resolve(0));
+      const dl = join(mkdtempSync(join(tmpdir(), 'cm-dl-')), 'dead-letters.jsonl');
+      process.env.CLAUDE_MEM_DEAD_LETTER_PATH = dl;
       mockSessionManager = {
         getMessageIterator: async function* () { yield* []; },
         getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
@@ -554,14 +558,18 @@ describe('ResponseProcessor', () => {
         'TestAgent'
       );
 
-      expect(logger.warn).toHaveBeenCalledWith(
+      expect(logger.error).toHaveBeenCalledWith(
         'PARSER',
-        expect.stringMatching(/^TestAgent returned non-XML prose response/),
-        expect.objectContaining({ sessionId: 1, outputClass: 'prose' })
+        expect.stringMatching(/^TestAgent returned unparsable prose response after/),
+        expect.objectContaining({ sessionId: 1, outputClass: 'prose', deadLetter: true })
       );
       expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
       expect(session.earliestPendingTimestamp).toBeNull();
       expect(mockStoreObservations).not.toHaveBeenCalled();
+      const deadLetters = readFileSync(dl, 'utf-8').trim().split('\n').filter(Boolean);
+      expect(deadLetters.length).toBe(1);
+      expect(JSON.parse(deadLetters[0]).reason).toBe('no_xml');
+      delete process.env.CLAUDE_MEM_DEAD_LETTER_PATH;
     });
   });
 
@@ -1020,6 +1028,146 @@ describe('ResponseProcessor', () => {
       await processAgentResponse(responseText, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
 
       expect(session.lastSummaryStored).toBe(false);
+    });
+  });
+
+  describe('durable recovery (Issue #2) — never silently drop a queued batch', () => {
+    const VALID_OBS = `<observation>\n<type>decision</type>\n<title>T</title>\n<facts></facts>\n<concepts></concepts>\n<files_read></files_read>\n<files_modified></files_modified>\n</observation>`;
+
+    function tempDeadLetterPath(): string {
+      return join(mkdtempSync(join(tmpdir(), 'cm-rec-')), 'dead-letters.jsonl');
+    }
+
+    it('E: invalid first response + valid retry -> store exactly once (no duplicate)', async () => {
+      const session = createMockSession();
+      mockStoreObservations.mockImplementation(() => ({
+        observationIds: [1],
+        summaryId: null,
+        createdAtEpoch: 1700000000000,
+      } as StorageResult));
+      let reaskCalls = 0;
+
+      await processAgentResponse(
+        'my bad prose, no xml',
+        session,
+        mockDbManager,
+        mockSessionManager,
+        mockWorker,
+        100,
+        null,
+        'TestAgent',
+        undefined, undefined, undefined,
+        async () => { reaskCalls++; return VALID_OBS; }
+      );
+
+      expect(reaskCalls).toBe(1); // bounded: GENERATION_RETRY_ATTEMPTS - 1
+      expect(mockStoreObservations).toHaveBeenCalledTimes(1);
+    });
+
+    it('E: recoverable invalid output clears the invalid-output counter', async () => {
+      const session = createMockSession({ consecutiveInvalidOutputs: 2 });
+      mockStoreObservations.mockImplementation(() => ({
+        observationIds: [1],
+        summaryId: null,
+        createdAtEpoch: 1700000000000,
+      } as StorageResult));
+      await processAgentResponse(
+        'no xmll here',
+        session, mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent',
+        undefined, undefined, undefined,
+        async () => VALID_OBS
+      );
+      expect(session.consecutiveInvalidOutputs).toBe(0);
+    });
+
+    it('B: prose + single embedded XML -> parsed and stored once', async () => {
+      const session = createMockSession();
+      mockStoreObservations.mockImplementation(() => ({
+        observationIds: [1],
+        summaryId: null,
+        createdAtEpoch: 1700000000000,
+      } as StorageResult));
+      const dl = tempDeadLetterPath();
+      process.env.CLAUDE_MEM_DEAD_LETTER_PATH = dl;
+      await processAgentResponse(
+        `Here is what I found:\n${VALID_OBS}\nthat is all.`,
+        session, mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent'
+      );
+      expect(mockStoreObservations).toHaveBeenCalledTimes(1);
+      expect(existsSync(dl)).toBe(false); // recovered, nothing dead-lettered
+    });
+
+    it('C: truncated/unclosed XML bucket -> dead-letter, nothing stored, pending cleared', async () => {
+      const session = createMockSession();
+      const dl = tempDeadLetterPath();
+      process.env.CLAUDE_MEM_DEAD_LETTER_PATH = dl;
+      await processAgentResponse(
+        '<observation>\n<type>decision</type>\n<title>partial never closed',
+        session, mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent'
+      );
+      expect(mockStoreObservations).not.toHaveBeenCalled();
+      const records = readFileSync(dl, 'utf-8').trim().split('\n').filter(Boolean);
+      expect(records.length).toBe(1);
+      expect(JSON.parse(records[0]).reason).toBe('truncated');
+      expect(session.earliestPendingTimestamp).toBeNull();
+    });
+
+    it('D: multiple <summary> documents -> ambiguous, dead-letter (no guess, no silent pick)', async () => {
+      const session = createMockSession();
+      const dl = tempDeadLetterPath();
+      process.env.CLAUDE_MEM_DEAD_LETTER_PATH = dl;
+      await processAgentResponse(
+        `<summary><request>a</request></summary>\n<summary><request>b</request></summary>`,
+        session, mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent'
+      );
+      expect(mockStoreObservations).not.toHaveBeenCalled();
+      const records = readFileSync(dl, 'utf-8').trim().split('\n').filter(Boolean);
+      expect(records.length).toBe(1);
+      expect(JSON.parse(records[0]).reason).toBe('multiple_documents');
+    });
+
+    it('F: invalid on all attempts -> dead-lettered with raw evidence (recoverable, not dropped)', async () => {
+      const session = createMockSession();
+      const dl = tempDeadLetterPath();
+      process.env.CLAUDE_MEM_DEAD_LETTER_PATH = dl;
+      let reaskCalls = 0;
+      await processAgentResponse(
+        '<observation>\nbroken',
+        session, mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent',
+        undefined, undefined, undefined,
+        async () => { reaskCalls++; return 'still-not-xml'; }
+      );
+      expect(reaskCalls).toBeLessThanOrEqual(1); // bounded, no infinite loop
+      expect(mockStoreObservations).not.toHaveBeenCalled();
+      const records = readFileSync(dl, 'utf-8').trim().split('\n').filter(Boolean);
+      expect(records.length).toBe(1);
+      expect(['no_xml', 'truncated']).toContain(JSON.parse(records[0]).reason);
+      expect(JSON.parse(records[0]).raw).toContain('<observation>');
+    });
+
+    it('F: bounded retry — never loops more than the configured attempts', async () => {
+      const session = createMockSession();
+      let reaskCalls = 0;
+      await processAgentResponse(
+        'bang',
+        session, mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent',
+        undefined, undefined, undefined,
+        async () => { reaskCalls++; return 'also-bad'; }
+      );
+      expect(reaskCalls).toBeLessThanOrEqual(1);
+    });
+
+    it('Q: plain-text skip responses are not re-queued (no observer loop), dead-lettered instead', async () => {
+      const session = createMockSession();
+      const dl = tempDeadLetterPath();
+      process.env.CLAUDE_MEM_DEAD_LETTER_PATH = dl;
+      await processAgentResponse(
+        'Skipping — repeated log scan with no new findings.',
+        session, mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent'
+      );
+      expect(mockStoreObservations).not.toHaveBeenCalled();
+      const records = readFileSync(dl, 'utf-8').trim().split('\n').filter(Boolean);
+      expect(records.length).toBe(1);
     });
   });
 });

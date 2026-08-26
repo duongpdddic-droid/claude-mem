@@ -84,6 +84,59 @@ export function parseAgentXml(raw: string, correlationId?: string | number): Par
   return { valid: true, observations: [], summary };
 }
 
+/**
+ * Recovery classifier for the durable-observation-loss fix (Issue #2).
+ *
+ * `parseAgentXml` already tolerant-extracts a SINGLE root document out of
+ * surrounding prose (so "prose + exactly one valid XML" is stored directly).
+ * What it does NOT distinguish — and what the old `ignoring queued batch` path
+ * silently dropped on — is *why* a payload failed to parse. This strict
+ * document-count classifier counts only COMPLETE, well-formed root documents
+ * (matching open+close tags) and is used to decide retry vs. store-vs-dead-letter.
+ *
+ * IMPORTANT: this never persists or returns malformed XML. It only classifies.
+ *
+ *  - 'single'              : exactly one coherent document (a batch of
+ *                            <observation> blocks is one expected response, as
+ *                            is one <summary>). Safe to store.
+ *  - 'multiple_documents'  : mixed/duplicate root types present
+ *                            (e.g. <observation> AND <summary>, or >1 summary).
+ *                            Ambiguous — do NOT guess which to keep; retry.
+ *  - 'truncated'           : a root tag is open but never closed (partial doc).
+ *                            Retry — the model may complete it.
+ *  - 'no_xml'              : no root tag at all (pure prose / empty). Retry.
+ */
+export type DocumentOutcome = 'single' | 'multiple_documents' | 'truncated' | 'no_xml';
+
+export function classifyResponseDocument(raw: string): DocumentOutcome {
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return 'no_xml';
+  }
+
+  const stripped = stripCodeFences(raw);
+
+  const completeObservations = (stripped.match(/<observation>[\s\S]*?<\/observation>/gi) ?? []).length;
+  const completeSummaries = (stripped.match(/<summary>[\s\S]*?<\/summary>/gi) ?? []).length;
+
+  // Mixed roots or more than one summary are ambiguous — never guess which to store.
+  if ((completeObservations > 0 && completeSummaries > 0) || completeSummaries > 1) {
+    return 'multiple_documents';
+  }
+
+  // A homogeneous batch of observations is a single coherent response.
+  if (completeObservations > 0) {
+    return 'single';
+  }
+
+  if (completeSummaries === 1) {
+    return 'single';
+  }
+
+  // No complete document: truncated only if a root tag was opened but not closed.
+  const openRoot = /<(observation|summary)\b/i.exec(stripped);
+  return openRoot ? 'truncated' : 'no_xml';
+}
+
 function parseObservationBlocks(text: string, correlationId?: string | number): ParsedObservation[] {
   const observations: ParsedObservation[] = [];
 

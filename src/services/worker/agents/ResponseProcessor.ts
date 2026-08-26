@@ -1,6 +1,6 @@
 
 import { logger } from '../../../utils/logger.js';
-import { parseAgentXml, type ParsedObservation, type ParsedSummary } from '../../../sdk/parser.js';
+import { parseAgentXml, classifyResponseDocument, type DocumentOutcome, type ParsedObservation, type ParsedSummary } from '../../../sdk/parser.js';
 import {
   classifyObserverOutput,
   isAuthFailureObserverOutput,
@@ -20,6 +20,8 @@ import type { SessionManager } from '../SessionManager.js';
 import type { WorkerRef, StorageResult } from './types.js';
 import { broadcastObservation, broadcastSummary } from './ObservationBroadcaster.js';
 import { telemetryBuffer } from '../../telemetry/buffer.js';
+import { GENERATION_RETRY_ATTEMPTS, REASK_PURE_XML_PROMPT } from './generate-retry.js';
+import { appendDeadLetter } from './dead-letter.js';
 
 type ObservationFileEvidenceMessage = Pick<PendingMessage, 'type' | 'tool_name' | 'tool_input'>;
 
@@ -71,6 +73,12 @@ export function extractObservationFileEvidence(messages: ReadonlyArray<Observati
     files_read: filesRead,
     files_modified: filesModified,
   };
+}
+
+/** Narrow a classifier outcome to the malformed kinds (a valid 'single'
+ * classification cannot coexist with a failed parse). */
+function toMalformedOutcome(o: DocumentOutcome): Exclude<DocumentOutcome, 'single'> {
+  return o === 'single' ? 'truncated' : o;
 }
 
 function pushUnique(seen: Set<string>, output: string[], filePath: string): void {
@@ -285,7 +293,8 @@ export async function processAgentResponse(
   agentName: string,
   projectRoot?: string,
   modelId?: string,
-  responseContext?: ResponseContext
+  responseContext?: ResponseContext,
+  reaskForRecovery?: () => Promise<string | null>
 ): Promise<void> {
   const processingStartedAt = Date.now();
   session.lastGeneratorActivity = Date.now();
@@ -295,7 +304,18 @@ export async function processAgentResponse(
     session.conversationHistory.push({ role: 'assistant', content: text });
   }
 
-  const parsed = parseAgentXml(text, session.contentSessionId);
+  let parsed = parseAgentXml(text, session.contentSessionId);
+
+  // Ambiguity guard (Issue #2): parseAgentXml tolerantly picks the FIRST root
+  // type, so it already handles observation+summary in one response (observation
+  // wins, trailing summary ignored — an established store contract). The
+  // genuinely ambiguous case is MULTIPLE <summary> documents (which one is the
+  // real summary?); there is no defined winner, so treat that as malformed and
+  // let it retry (or dead-letter) instead of silently picking one.
+  const summaryDocCount = (text.match(/<summary>[\s\S]*?<\/summary>/gi) ?? []).length;
+  if (parsed.valid && summaryDocCount > 1) {
+    parsed = { valid: false };
+  }
 
   // Provider enum for telemetry, derived once so the invalid-output and
   // success paths stamp the same value.
@@ -345,25 +365,96 @@ export async function processAgentResponse(
       return;
     }
 
-    // Classify the non-XML output so a dropped batch is visible, not silent.
-    // Ordinary idle/prose is a claimed no-op batch: confirm it and do not build
-    // any respawn debt from repeated skip acknowledgements.
+    // Durable-observation-loss fix (Issue #2): never silently drop a queued
+    // batch on one malformed turn. Three ways out of an invalid response:
+    //   1. safe re-parse: the retry reasks for pure XML; the FIRST successful
+    //      parse re-enters the store path below (single store, no duplicate).
+    //   2. exhausted: dead-letter the raw response + message ids as evidence.
+    //   3. deferred (quota/auth): handled above, batch preserved by abort.
+    let lastOutcome: Exclude<DocumentOutcome, 'single'> = toMalformedOutcome(classifyResponseDocument(text));
+    let retriesUsed = 0;
+    let recovered = false;
+
+    if (reaskForRecovery) {
+      for (; retriesUsed < GENERATION_RETRY_ATTEMPTS - 1; retriesUsed++) {
+        let retryText: string | null = null;
+        try {
+          retryText = await reaskForRecovery();
+        } catch (error) {
+          logger.error('PARSER', `${agentName} recovery reask failed`, {
+            sessionId: session.sessionDbId,
+            attempt: retriesUsed + 1,
+          }, error instanceof Error ? error : new Error(String(error)));
+          break;
+        }
+        if (!retryText) {
+          break;
+        }
+        const retryParsed = parseAgentXml(retryText);
+        if (retryParsed.valid) {
+          text = retryText;
+          parsed = retryParsed;
+          recovered = true;
+          break;
+        }
+        lastOutcome = toMalformedOutcome(classifyResponseDocument(retryText));
+      }
+    }
+
     const outputClass = classifyObserverOutput(text);
     const preview = previewOutput(text);
     session.consecutiveInvalidOutputs = 0;
 
-    logger.warn('PARSER', `${agentName} returned non-XML ${outputClass} response — ignoring queued batch`, {
-      sessionId: session.sessionDbId,
-      outputClass,
-      preview,
-      consecutiveInvalidOutputs: session.consecutiveInvalidOutputs,
-    });
+    if (!parsed.valid) {
+      // Exhausted every attempt (or no reask available): keep evidence, don't
+      // silently drop. Write one dead-letter record and log the exact batch /
+      // session / message identifiers so a repair/replay pass can find it.
+      const claimed = sessionManager.getClaimedMessages?.(session.sessionDbId) ?? [];
+      const messageIds = session.claimedMessageIds;
+      const toolNames = claimed.map(m =>
+        typeof (m as { tool_name?: unknown }).tool_name === 'string'
+          ? (m as { tool_name: string }).tool_name
+          : null
+      ).filter((n): n is string => n !== null);
 
-    // Plain-text skip responses are intentionally ignored. Re-queueing them
-    // creates an observer loop where the same low-signal batch is retried.
-    await sessionManager.confirmClaimedMessages(session.sessionDbId);
-    session.earliestPendingTimestamp = null;
-    return;
+      appendDeadLetter({
+        sessionDbId: session.sessionDbId,
+        memorySessionId: session.memorySessionId,
+        contentType: context.pendingAgentType === 'summarize' ? 'summary' : 'observation',
+        provider: providerName,
+        model: modelId ?? null,
+        reason: lastOutcome,
+        attempts: retriesUsed + 1,
+        messageIds,
+        messageToolNames: toolNames,
+        raw: text,
+        createdAtEpoch: Date.now(),
+      });
+
+      logger.error('PARSER', `${agentName} returned unparsable ${outputClass} response after ${retriesUsed + 1} attempts — batch dead-lettered (not silently dropped)`, {
+        sessionId: session.sessionDbId,
+        provider: providerName,
+        outputClass,
+        reason: lastOutcome,
+        attempts: retriesUsed + 1,
+        messageIds,
+        messageToolNames: toolNames,
+        deadLetter: true,
+        preview,
+      });
+
+      // Plain-text skip responses are intentionally ignored (confirm claimed).
+      // Re-queueing them creates an observer loop where the same low-signal
+      // batch is retried. The evidence above keeps the loss recoverable.
+      await sessionManager.confirmClaimedMessages(session.sessionDbId);
+      session.earliestPendingTimestamp = null;
+      return;
+    }
+
+    logger.warn('PARSER', `${agentName} recovered ${recovered ? 'on retry' : 'from embedded XML'} after invalid ${outputClass} response`, {
+      sessionId: session.sessionDbId,
+      reason: lastOutcome,
+    });
   }
 
   // Valid parse — clear the invalid-output counter so transient misses don't
