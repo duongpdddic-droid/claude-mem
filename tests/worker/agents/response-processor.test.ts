@@ -1,5 +1,5 @@
 import { describe, it, expect, mock, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
-import { existsSync, readFileSync, mkdtempSync } from 'fs';
+import { existsSync, readFileSync, mkdtempSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { logger } from '../../../src/utils/logger.js';
@@ -657,13 +657,6 @@ describe('ResponseProcessor', () => {
           <files_read></files_read>
           <files_modified></files_modified>
         </observation>
-        <summary>
-          <request>Test request</request>
-          <investigated>Test investigated</investigated>
-          <learned>Test learned</learned>
-          <completed>Test completed</completed>
-          <next_steps>Test next steps</next_steps>
-        </summary>
       `;
 
       await processAgentResponse(
@@ -1168,6 +1161,64 @@ describe('ResponseProcessor', () => {
       expect(mockStoreObservations).not.toHaveBeenCalled();
       const records = readFileSync(dl, 'utf-8').trim().split('\n').filter(Boolean);
       expect(records.length).toBe(1);
+    });
+
+    it('A: observation + summary in one response -> multiple_documents, dead-letter (no partial store)', async () => {
+      const session = createMockSession();
+      const dl = tempDeadLetterPath();
+      process.env.CLAUDE_MEM_DEAD_LETTER_PATH = dl;
+      await processAgentResponse(
+        `${VALID_OBS}\n<summary><request>r</request></summary>`,
+        session, mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent'
+      );
+      expect(mockStoreObservations).not.toHaveBeenCalled(); // no partial store
+      const records = readFileSync(dl, 'utf-8').trim().split('\n').filter(Boolean);
+      expect(records.length).toBe(1);
+      expect(JSON.parse(records[0]).reason).toBe('multiple_documents');
+    });
+
+    it('C: homogeneous multiple <observation> blocks remain valid (stored, no ambiguity)', async () => {
+      const session = createMockSession();
+      mockStoreObservations.mockImplementation(() => ({
+        observationIds: [1, 2],
+        summaryId: null,
+        createdAtEpoch: 1700000000000,
+      } as StorageResult));
+      const dl = tempDeadLetterPath();
+      process.env.CLAUDE_MEM_DEAD_LETTER_PATH = dl;
+      await processAgentResponse(
+        `${VALID_OBS}\n${VALID_OBS.replace('decision', 'feature')}`,
+        session, mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent'
+      );
+      expect(mockStoreObservations).toHaveBeenCalledTimes(1);
+      expect(mockStoreObservations.mock.calls[0][2]).toHaveLength(2);
+      expect(existsSync(dl)).toBe(false); // valid homogeneous batch, not dead-lettered
+    });
+
+    it('G: dead-letter write FAILURE -> NOT confirm claimed, batch retained/requeued to pending', async () => {
+      const session = createMockSession();
+      // Make dirname a regular file that is NOT a directory, so
+      // mkdirSync/appendFileSync throw and appendDeadLetter returns false.
+      const blocker = join(mkdtempSync(join(tmpdir(), 'cm-dlfail-')), 'blocker');
+      writeFileSync(blocker, 'i am a file, not a dir', 'utf-8');
+      process.env.CLAUDE_MEM_DEAD_LETTER_PATH = join(blocker, 'dead.jsonl');
+
+      const confirmClaimed = mock(() => Promise.resolve(0));
+      const resetPending = mock(() => Promise.resolve(1));
+      const sessionManager = {
+        ...mockSessionManager,
+        confirmClaimedMessages: confirmClaimed,
+        resetProcessingToPending: resetPending,
+      };
+
+      await processAgentResponse(
+        '<observation>\nbroken', // invalid, no recovery reask, dead-letter write fails
+        session, mockDbManager, sessionManager, mockWorker, 100, null, 'TestAgent'
+      );
+
+      expect(mockStoreObservations).not.toHaveBeenCalled();
+      expect(confirmClaimed).not.toHaveBeenCalled(); // P1 finding 4: never confirm/drop on failed dead-letter
+      expect(resetPending).toHaveBeenCalledWith(1);   // batch requeued to pending, stays recoverable
     });
   });
 });

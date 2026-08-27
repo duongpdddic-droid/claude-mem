@@ -306,14 +306,12 @@ export async function processAgentResponse(
 
   let parsed = parseAgentXml(text, session.contentSessionId);
 
-  // Ambiguity guard (Issue #2): parseAgentXml tolerantly picks the FIRST root
-  // type, so it already handles observation+summary in one response (observation
-  // wins, trailing summary ignored — an established store contract). The
-  // genuinely ambiguous case is MULTIPLE <summary> documents (which one is the
-  // real summary?); there is no defined winner, so treat that as malformed and
-  // let it retry (or dead-letter) instead of silently picking one.
-  const summaryDocCount = (text.match(/<summary>[\s\S]*?<\/summary>/gi) ?? []).length;
-  if (parsed.valid && summaryDocCount > 1) {
+  // Ambiguity guard (Issue #2) — single, consistent store contract. A response
+  // that classifies as 'multiple_documents' (mixed roots, e.g. an
+  // <observation> AND a <summary>, or more than one <summary>) is ambiguous:
+  // picking the first root and silently dropping the rest is a partial guess.
+  // Route it to recovery (retry) / dead-letter instead of storing half.
+  if (parsed.valid && classifyResponseDocument(text) === 'multiple_documents') {
     parsed = { valid: false };
   }
 
@@ -417,7 +415,11 @@ export async function processAgentResponse(
           : null
       ).filter((n): n is string => n !== null);
 
-      appendDeadLetter({
+      // Persist the evidence FIRST. Only if it durably landed do we confirm
+      // (drop) the claimed messages. If the write failed, we must NOT confirm —
+      // we keep the batch recoverable by resetting/requeueing to pending and
+      // log an ERROR, so a dead-letter failure can never become a silent loss.
+      const persisted = appendDeadLetter({
         sessionDbId: session.sessionDbId,
         memorySessionId: session.memorySessionId,
         contentType: context.pendingAgentType === 'summarize' ? 'summary' : 'observation',
@@ -431,7 +433,31 @@ export async function processAgentResponse(
         createdAtEpoch: Date.now(),
       });
 
-      logger.error('PARSER', `${agentName} returned unparsable ${outputClass} response after ${retriesUsed + 1} attempts — batch dead-lettered (not silently dropped)`, {
+      if (persisted) {
+        logger.error('PARSER', `${agentName} returned unparsable ${outputClass} response after ${retriesUsed + 1} attempts — batch dead-lettered (not silently dropped)`, {
+          sessionId: session.sessionDbId,
+          provider: providerName,
+          outputClass,
+          reason: lastOutcome,
+          attempts: retriesUsed + 1,
+          messageIds,
+          messageToolNames: toolNames,
+          deadLetter: true,
+          preview,
+        });
+
+        // Evidence safely persisted — safe to confirm (drop) the batch.
+        await sessionManager.confirmClaimedMessages(session.sessionDbId);
+        session.earliestPendingTimestamp = null;
+        return;
+      }
+
+      // Dead-letter persistence FAILED: keep the batch recoverable. Do NOT
+      // confirm the claimed messages; reset/requeue them to pending so a later
+      // generator pass can retry. The generator is event-driven (only starts on
+      // the next ingest / ensureGeneratorRunning), so this does NOT spin: the
+      // batch simply stays pending until the next natural pass.
+      logger.error('PARSER', `${agentName} returned unparsable ${outputClass} response after ${retriesUsed + 1} attempts AND dead-letter write FAILED — batch retained/requeued to pending (not dropped)`, {
         sessionId: session.sessionDbId,
         provider: providerName,
         outputClass,
@@ -439,15 +465,10 @@ export async function processAgentResponse(
         attempts: retriesUsed + 1,
         messageIds,
         messageToolNames: toolNames,
-        deadLetter: true,
+        deadLetterWriteFailed: true,
         preview,
       });
-
-      // Plain-text skip responses are intentionally ignored (confirm claimed).
-      // Re-queueing them creates an observer loop where the same low-signal
-      // batch is retried. The evidence above keeps the loss recoverable.
-      await sessionManager.confirmClaimedMessages(session.sessionDbId);
-      session.earliestPendingTimestamp = null;
+      await sessionManager.resetProcessingToPending(session.sessionDbId);
       return;
     }
 

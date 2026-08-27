@@ -37,17 +37,20 @@ export function resolveDeadLetterPath(): string {
 }
 
 /**
- * Append one evidence record. Never throws on write failure (observability
- * must not take down the observer pipeline) — a failed append is surfaced as a
- * logger.error so the loss is still not silent.
+ * Append one evidence record. Returns `true` only when the record was durably
+ * persisted, `false` on any filesystem failure. The caller MUST treat `false`
+ * as a failed dead-letter: it must NOT confirm (drop) the claimed messages,
+ * and must keep the batch recoverable (e.g. reset/requeue to pending) plus log
+ * an ERROR. A failed write is surfaced to the caller rather than swallowed so
+ * a dead-letter failure can never silently become a permanent loss.
  */
-export function appendDeadLetter(entry: DeadLetterEntry): void {
+export function appendDeadLetter(entry: DeadLetterEntry): boolean {
   const path = resolveDeadLetterPath();
   try {
     mkdirSync(dirname(path), { recursive: true });
     appendFileSync(path, JSON.stringify(entry) + '\n', 'utf-8');
-  } catch (error) {
-    // eslint-disable-next-line no-console
-    console.error('DEAD_LETTER write failed', { path }, error);
+    return true;
+  } catch {
+    return false;
   }
 }
